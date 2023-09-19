@@ -243,17 +243,25 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
                 k = 0
 
             if is_cross:
-                
+                affine = True
+                replace = attn_editor_bundle['replace_attention']
+                load = True
+
+                if not os.path.exists(attn_editor_bundle["prompt"][0]+ " " + str(attn_editor_bundle["seed"])):
+                    attn_editor_bundle["save_latents"] = True
+                    os.mkdir(attn_editor_bundle["prompt"][0]+ " " + str(attn_editor_bundle["seed"]))
                 if attn_editor_bundle["save_latents"]:
+                    attn_editor_bundle["edit_latents"] = False
                     self.all_cross_attn.append(attn[0])
+                    affine = False
+                    replace = False
+                    load = False
                 # print('cross ' , attn.shape , place_in_unet, ' ', self.cur_step)
                 # alpha_words = self.cross_replace_alpha[self.cur_step]
                 # attn_repalce_new = self.replace_cross_attention(attn_base, attn_repalce) * alpha_words + (1 - alpha_words) * attn_repalce
                 attn_repalce_new = attn_base
-                affine = True
-                # load = True
-                replace = attn_editor_bundle['replace_attention']
-                if not attn_editor_bundle['save_latents']:
+
+                if load:
                     cur_map = self.maps[0]
                     self.maps.pop(0)
                     attn_repalce_new = cur_map
@@ -267,8 +275,15 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
                     attn_repalce_new = attn_repalce_new.permute(0, 3, 1, 2)
                     # attn_repalce_new2 = attn_repalce_new.deepcopy()
                     # attn_repalce_new = affine_transfomer(attn_repalce_new)
-                    attn_repalce_new = T.functional.affine(attn_repalce_new, translate=(float(-10*attn_repalce_new.shape[2]/64), 0), scale=1, shear=[0, 0], angle = 0)
-                    
+                    if attn_editor_bundle["translate"][0] != 0.0:
+                        attn_repalce_new = T.functional.affine(attn_repalce_new, translate=(float(attn_editor_bundle["translate"][0]*attn_repalce_new.shape[2]/64), 0), scale=1, shear=[0, 0], angle = 0)
+                    if attn_editor_bundle["scale"][0] != 1.0:
+                        attn_repalce_new = T.functional.affine(attn_repalce_new, translate=(0, 0), scale=float(attn_editor_bundle["scale"][0]), shear=[0, 0], angle = 0)
+                    if attn_editor_bundle["shear"][0] != 0.0:
+                        attn_repalce_new = T.functional.affine(attn_repalce_new, translate=(0, 0), scale=1, shear=[float(attn_editor_bundle["shear"][0]), 0], angle = 0)
+                    if attn_editor_bundle["angle"][0] != 0.0:
+                        attn_repalce_new = T.functional.affine(attn_repalce_new, translate=(0, 0), scale=1, shear=[0, 0], angle = float(attn_editor_bundle["angle"][0]))
+
                     attn_repalce_new = attn_repalce_new.permute(0, 2, 3, 1)
                     attn_repalce_new = attn_repalce_new.reshape(attn[0].shape)
                 # 
@@ -538,8 +553,7 @@ def text2image_ldm_stable(
     uncond_embeddings=None,
     start_time=50,
     return_type='image', 
-    edit_latents = False,
-    step_to_replace = 0
+    attn_editor_bundle = {}
 ):
     global all_attns
     batch_size = len(prompt)
@@ -574,16 +588,16 @@ def text2image_ldm_stable(
         else:
             context = torch.cat([uncond_embeddings_, text_embeddings])
         # load = True
-        if not attn_editor_bundle["save_latents"]:
-            controller.maps = torch.load(attn_editor_bundle["prompt"][0]+'/'+str(controller.cur_step+1)+'.pt')
+        if not attn_editor_bundle["save_latents"] and os.path.exists(attn_editor_bundle["prompt"][0] +" " + str(attn_editor_bundle["seed"])):
+            controller.maps = torch.load(attn_editor_bundle["prompt"][0] +" " + str(attn_editor_bundle["seed"])+'/'+str(controller.cur_step+1)+'.pt')
         # latents = ptp_utils.diffusion_step(model, controller, latents, context, t, guidance_scale, low_resource=False)
-        latents = ptp_utils.diffusion_step_modified(model, controller, latents, context, t, guidance_scale, low_resource=False, edit_latents=edit_latents, step_to_replace=step_to_replace)
+        latents = ptp_utils.diffusion_step_modified(model, controller, latents, context, t, guidance_scale, low_resource=False, attn_editor_bundle=attn_editor_bundle)
         all_attns.append(show_cross_attention_ui(controller, res=16, from_where=("up", "down"), select = 0))
         # save = False
-        if attn_editor_bundle["save_latents"] and hasattr(controller, 'all_cross_attn'):
-            if not os.path.exists(attn_editor_bundle["prompt"][0]):
-                os.mkdir(attn_editor_bundle["prompt"][0])
-            torch.save(controller.all_cross_attn,attn_editor_bundle["prompt"][0]+"/"+str(controller.cur_step)+'.pt')
+        if attn_editor_bundle["save_latents"] and os.path.exists(attn_editor_bundle["prompt"][0] + " " + str(attn_editor_bundle["seed"])) and hasattr(controller, 'all_cross_attn'):
+            # if not os.path.exists(attn_editor_bundle["prompt"][0]):
+            #     os.mkdir(attn_editor_bundle["prompt"][0])
+            torch.save(controller.all_cross_attn,attn_editor_bundle["prompt"][0]+" " + str(attn_editor_bundle["seed"])+"/"+str(controller.cur_step)+'.pt')
             # all_cross.append(controller.all_cross_attn)
     if return_type == 'image':
         image = ptp_utils.latent2image(model.vae, latents)
@@ -592,27 +606,28 @@ def text2image_ldm_stable(
     return image, latent
 
 
-def run_and_display(prompts, controller, latent=None, run_baseline=False, generator=None, uncond_embeddings=None, verbose=True):
+def run_and_display(prompts, controller, latent=None, run_baseline=False, generator=None, uncond_embeddings=None,  attn_editor_bundle = {}, verbose=True):
     if run_baseline:
         print("w.o. prompt-to-prompt")
         images, x_t = run_and_display(prompts, EmptyControl(), latent=latent, run_baseline=False, generator=generator, uncond_embeddings=uncond_embeddings)
 
         print("with prompt-to-prompt")
     else:
-        images, x_t = text2image_ldm_stable(ldm_stable, prompts, controller, latent=latent, num_inference_steps=NUM_DDIM_STEPS, guidance_scale=GUIDANCE_SCALE, generator=generator, uncond_embeddings=uncond_embeddings, edit_latents=False, step_to_replace=0)
+        attn_editor_bundle["edit_latents"] = False
+        images, x_t = text2image_ldm_stable(ldm_stable, prompts, controller, latent=latent, num_inference_steps=NUM_DDIM_STEPS, guidance_scale=GUIDANCE_SCALE, generator=generator, uncond_embeddings=uncond_embeddings, attn_editor_bundle =attn_editor_bundle)
         images_to_draw = ptp_utils.to_images(images)
         # images2, x_t2 = text2image_ldm_stable_second(ldm_stable, prompts, controller, latent=latent, num_inference_steps=NUM_DDIM_STEPS, guidance_scale=GUIDANCE_SCALE, generator=generator, uncond_embeddings=uncond_embeddings)
     # # if verbose:
     #     ptp_utils.view_images(images)
     return images, x_t, images_to_draw
 
-def run_and_display2(prompts, controller, latent=None, run_baseline=False, generator=None, uncond_embeddings=None, verbose=True, edit_latents=False, step_to_replace=0):
+def run_and_display2(prompts, controller, latent=None, run_baseline=False, generator=None, uncond_embeddings=None, verbose=True, attn_editor_bundle = {}):
     if run_baseline:
         print("w.o. prompt-to-prompt")
         # images, x_t = run_and_display(prompts, EmptyControl(), latent=latent, run_baseline=False, generator=generator, uncond_embeddings=uncond_embeddings)
         print("with prompt-to-prompt")
 
-    images, x_t = text2image_ldm_stable(ldm_stable, prompts, controller, latent=latent, num_inference_steps=NUM_DDIM_STEPS, guidance_scale=GUIDANCE_SCALE, generator=generator, uncond_embeddings=uncond_embeddings, edit_latents=edit_latents, step_to_replace=step_to_replace)
+    images, x_t = text2image_ldm_stable(ldm_stable, prompts, controller, latent=latent, num_inference_steps=NUM_DDIM_STEPS, guidance_scale=GUIDANCE_SCALE, generator=generator, uncond_embeddings=uncond_embeddings, attn_editor_bundle = attn_editor_bundle)
     if verbose:
         images2 = ptp_utils.to_images(images)
     return images, x_t, images2
@@ -679,6 +694,10 @@ def attention_run(
     save_latents,
     is_draw_bbox,
     mask,
+    translate,
+    scale,
+    shear,
+    angle
 ):
     global x_t
     global attn_editor_bundle
@@ -689,6 +708,7 @@ def attention_run(
     attn_editor_bundle = {
         "edit_index": str_arg_to_val(in_token_ids, int),
         "roi": roi,
+        "seed": int(in_seed),
         "num_trailing_attn": [in_slider_trailings] * len(roi),
         "num_affected_steps": in_slider_ddsteps,
         "noise_scale": [in_slider_gcoef] * len(roi),
@@ -696,7 +716,11 @@ def attention_run(
         "replace_attention": replace_attention,
         "step_to_replace": step_to_replace,
         "save_latents": save_latents,
-        "prompt": [in_prompt]
+        "prompt": [in_prompt],
+        "translate": str_arg_to_val(translate, float)[0],
+        "scale": str_arg_to_val(scale, float)[0],
+        "shear": str_arg_to_val(shear, float)[0],
+        "angle": str_arg_to_val(angle, float)[0]
     }
     # img = DirectedDiffusion.Diffusion.stablediffusion(
     #     model_bundle,
@@ -725,7 +749,7 @@ def attention_run(
     # prompts = ["A painting of a squirrel eating a burger"]
     prompts = [in_prompt]
     controller = AttentionStore()
-    image, x_t, image_to_draw = run_and_display(prompts, controller, latent=None, run_baseline=False, generator=g_cpu)
+    image, x_t, image_to_draw = run_and_display(prompts, controller, latent=None, run_baseline=False, generator=g_cpu,  attn_editor_bundle = attn_editor_bundle)
     # mask2 = gr.Image(value=image_to_draw, label="Image for brushing with mask1", show_label=False, elem_id="img2maskimg1", interactive=True, type="pil", tool="sketch", image_mode="RGBA").style(height=480)
     # mask.change(change_image, inputs=[mask2], outputs=[mask2])
     return image_to_draw
@@ -748,6 +772,10 @@ def attention_edit(
     save_latents,
     is_draw_bbox,
     mask,
+    translate,
+    scale,
+    shear,
+    angle
 ):
     global mask2
     global attn_editor_bundle
@@ -761,6 +789,7 @@ def attention_edit(
     attn_editor_bundle = {
         "edit_index": str_arg_to_val(in_token_ids, int),
         "roi": roi,
+        "seed": int(in_seed),
         "num_trailing_attn": [in_slider_trailings] * len(roi),
         "num_affected_steps": in_slider_ddsteps,
         "noise_scale": [in_slider_gcoef] * len(roi),
@@ -768,7 +797,11 @@ def attention_edit(
         "replace_attention": replace_attention,
         "step_to_replace": step_to_replace,
         "save_latents": save_latents,
-        "prompt": [in_prompt]
+        "prompt": [in_prompt],
+        "translate": str_arg_to_val(translate, float)[0],
+        "scale": str_arg_to_val(scale, float)[0],
+        "shear": str_arg_to_val(shear, float)[0],
+        "angle": str_arg_to_val(angle, float)[0]
     }
     # img = DirectedDiffusion.Diffusion.stablediffusion(
     #     model_bundle,
@@ -813,7 +846,7 @@ def attention_edit(
     # "A photo of a dog in a beach"]
     # controller = AttentionReplace(prompts, NUM_DIFFUSION_STEPS, cross_replace_steps=.8, self_replace_steps=0.4)
     controller = AttentionReplace(prompts, NUM_DIFFUSION_STEPS, cross_replace_steps=1.0, self_replace_steps=1.0)
-    images2, x_t2, images_to_show = run_and_display2(prompts, controller, latent=x_t, run_baseline=True, edit_latents=edit_latents, step_to_replace=step_to_replace)
+    images2, x_t2, images_to_show = run_and_display2(prompts, controller, latent=x_t, run_baseline=True, attn_editor_bundle=attn_editor_bundle)
     # show_cross_attention(controller, res=16, from_where=("up", "down"), select = 1)
     # show_self_attention_comp(controller, res=16, from_where=("up", "down"), select = 1)
     return images_to_show
@@ -834,6 +867,10 @@ def run_it(
     is_draw_bbox,
     save_latents,
     mask,
+    translate,
+    scale,
+    shear,
+    angle,
     progress=gr.Progress(),
 ):
     global ALL_OUTPUT
@@ -874,7 +911,11 @@ def run_it(
             edit_latents=edit_latents,
             save_latents = save_latents,
             is_draw_bbox=is_draw_bbox,
-            mask = mask
+            mask = mask,
+            translate = translate,
+            scale = scale,
+            shear = shear,
+            angle = angle
         )
 
     return img
@@ -894,6 +935,10 @@ def edit_it(
     is_draw_bbox,
     save_latents,
     mask,
+    translate,
+    scale,
+    shear,
+    angle,
     progress=gr.Progress(),
 ):
     global ALL_OUTPUT
@@ -913,7 +958,6 @@ def edit_it(
     for i, element in enumerate(progress.tqdm(param_list)):
         print("=========== Arguments ============")
         print("Prompt:", in_prompt)
-        print("BoundingBox:", in_bb)
         print("Token indices:", in_token_ids)
         print("Num Trialings:", element[2])
         print("Num DD steps:", element[0])
@@ -933,7 +977,11 @@ def edit_it(
             replace_attention=replace_attention,
             save_latents = save_latents,
             is_draw_bbox=is_draw_bbox,
-            mask = mask
+            mask = mask,
+            translate = translate,
+            scale = scale,
+            shear = shear,
+            angle = angle
         )
         results.append(
             (
@@ -1012,6 +1060,12 @@ with gr.Blocks() as demo:
                     value=0, label="step_to_replace", interactive=True
                 )
             with gr.Row(variant="compact"):
+                translate = gr.Textbox(value="0.0", label="translate", interactive=True)
+                shear = gr.Textbox(value = "0.0", label="shear", interactive=True)
+                scale = gr.Textbox(value="1.0", label="scale", interactive=True)
+                angle = gr.Textbox(value="0.0", label="angle", interactive=True)
+
+            with gr.Row(variant="compact"):
                 save_latents = gr.Checkbox(
                     value=False,
                     label="save latents for editing?",
@@ -1078,7 +1132,11 @@ with gr.Blocks() as demo:
             replace_attention,
             is_draw_bbox,
             save_latents,
-            mask
+            mask,
+            translate,
+            scale,
+            shear,
+            angle
         ]
         
         btn_run.click(run_it, inputs=args, outputs=mask)
